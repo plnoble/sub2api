@@ -1,0 +1,112 @@
+name: outbox-claim-ci
+
+# Independent verification for the scheduler-outbox durable-claim change.
+#
+# Why a dedicated workflow: the production host must not compile Go any more (it
+# was OOM-killed once by an unbounded build), and the real concurrency guarantees
+# can only be shown against a real PostgreSQL. The upstream integration harness
+# spins postgres/redis with testcontainers, so the runner's Docker does the work.
+#
+# Dispatch with:
+#   gh workflow run outbox-claim-ci.yml --ref ci --repo <owner>/<repo> \
+#      -f target_ref=<branch-or-sha> -f build_release=true
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "branch, tag or sha to verify"
+        required: true
+      build_release:
+        description: "also build the release binary with the Makefile ldflags"
+        required: false
+        default: "false"
+      version_override:
+        description: "value for main.Version (empty = resolve-version.sh)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: build, unit and real-PostgreSQL concurrency tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout target ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0 # full history so Go can stamp vcs.revision
+          filter: blob:none
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+          cache: true
+
+      - name: Toolchain identity (must match go.mod)
+        run: |
+          go version
+          go version | grep -q "go1.27.3" || { echo "::error::go.mod requires go 1.27.3"; exit 1; }
+          git rev-parse HEAD
+
+      - name: gofmt (must be clean)
+        run: |
+          out="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$out" ]; then echo "::error::gofmt needs to run on: $out"; exit 1; fi
+
+      - name: go build ./...
+        run: go build ./...
+
+      - name: go vet (touched packages, unit + integration tags)
+        run: |
+          go vet ./internal/service/ ./internal/repository/
+          go vet -tags=integration ./internal/repository/
+
+      - name: Unit tests - new queue path and the untouched legacy path
+        run: go test -count=1 -run 'PollOutbox' -v ./internal/service/
+
+      - name: Regression - existing outbox tests
+        run: go test -count=1 -run 'Outbox|SchedulerOutbox' -v ./internal/service/ ./internal/repository/
+
+      - name: Real PostgreSQL consumer concurrency tests
+        env:
+          CI: "true"
+        run: |
+          go test -tags=integration -count=1 -timeout 900s \
+            -run 'TestOutboxClaim' -v ./internal/repository/ 2>&1 | tee /tmp/outbox-claim-it.log
+          grep -q '^--- PASS' /tmp/outbox-claim-it.log
+          ! grep -q '^--- FAIL' /tmp/outbox-claim-it.log
+
+      - name: Release build with the production Makefile recipe
+        if: ${{ inputs.build_release == 'true' }}
+        run: |
+          set -eu
+          if [ -n "${{ inputs.version_override }}" ]; then
+            echo "building with explicit VERSION=${{ inputs.version_override }}"
+            make build VERSION="${{ inputs.version_override }}"
+          else
+            make build
+          fi
+          ls -l bin/server
+          echo "--- sha256 ---"
+          sha256sum bin/server
+          echo "--- embedded version/commit ---"
+          ./bin/server --version || true
+          go version -m bin/server | sed -n '1,12p'
+
+      - name: Upload the release binary
+        if: ${{ inputs.build_release == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-release-${{ github.sha }}
+          path: backend/bin/server
+          if-no-files-found: error
+          retention-days: 14
