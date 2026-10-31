@@ -42,7 +42,6 @@ jobs:
         with:
           ref: ${{ inputs.target_ref }}
           fetch-depth: 0 # full history so Go can stamp vcs.revision
-          filter: blob:none
 
       - name: Set up Go from go.mod
         uses: actions/setup-go@v5
@@ -87,6 +86,8 @@ jobs:
 
       - name: Release build with the production Makefile recipe
         if: ${{ inputs.build_release == 'true' }}
+        env:
+          GOFLAGS: -mod=mod -buildvcs=true
         run: |
           set -eu
           if [ -n "${{ inputs.version_override }}" ]; then
@@ -100,7 +101,14 @@ jobs:
           sha256sum bin/server
           echo "--- embedded version/commit ---"
           ./bin/server --version || true
-          go version -m bin/server | sed -n '1,12p'
+          go version -m bin/server | sed -n '1,6p'
+          echo "--- VCS stamp gate: the binary must carry this commit ---"
+          head_sha="$(git rev-parse HEAD)"
+          stamped="$(go version -m bin/server | awk -F'\t' '/vcs.revision/{print $3}')"
+          echo "HEAD=$head_sha stamped=$stamped"
+          [ "$head_sha" = "$stamped" ] || { echo "::error::binary is not stamped with the built commit (got '$stamped')"; exit 1; }
+          go version -m bin/server | grep -q 'go1.27.3' || { echo "::error::wrong Go toolchain"; exit 1; }
+          ./bin/server --version 2>&1 | grep -q "${{ inputs.version_override }}" || { echo "::error::version string missing from the binary"; exit 1; }
 
       - name: Upload the release binary
         if: ${{ inputs.build_release == 'true' }}
