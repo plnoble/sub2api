@@ -90,26 +90,31 @@ jobs:
           GOFLAGS: -mod=mod -buildvcs=true
         run: |
           set -eu
-          if [ -n "${{ inputs.version_override }}" ]; then
-            echo "building with explicit VERSION=${{ inputs.version_override }}"
-            make build VERSION="${{ inputs.version_override }}"
-          else
-            make build
-          fi
+          head_sha="$(git rev-parse HEAD)"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          version="${{ inputs.version_override }}"
+          if [ -z "$version" ]; then version="$(./scripts/resolve-version.sh)"; fi
+          echo "building version=$version commit=$head_sha built=$built_at"
+          # Same Makefile recipe as production; the extra -X flags stamp the fields
+          # cmd/server/main.go prints in `--version` (Version, Commit, Date, BuildType).
+          make build VERSION="$version" \
+            LDFLAGS="-s -w -X main.Version=$version -X main.Commit=$head_sha -X main.Date=$built_at -X main.BuildType=release"
           ls -l bin/server
           echo "--- sha256 ---"
-          sha256sum bin/server
-          echo "--- embedded version/commit ---"
-          ./bin/server --version || true
+          sha256sum bin/server | tee /tmp/release.sha256
+          echo "--- banner ---"
+          ./bin/server --version 2>&1 | tee /tmp/release.version
+          echo "--- buildinfo ---"
           go version -m bin/server | sed -n '1,6p'
-          echo "--- VCS stamp gate: the binary must carry this commit ---"
-          head_sha="$(git rev-parse HEAD)"
-          stamped="$(go version -m bin/server | awk -F'\t' '/vcs.revision/{print $3}')"
+          echo "--- provenance gates ---"
+          stamped="$(go version -m bin/server | sed -n 's/.*vcs\.revision=\([0-9a-f]\{7,\}\).*/\1/p')"
           echo "HEAD=$head_sha stamped=$stamped"
-          [ "$head_sha" = "$stamped" ] || { echo "::error::binary is not stamped with the built commit (got '$stamped')"; exit 1; }
-          go version -m bin/server | grep -q 'go1.27.3' || { echo "::error::wrong Go toolchain"; exit 1; }
-          ./bin/server --version 2>&1 | grep -q "${{ inputs.version_override }}" || { echo "::error::version string missing from the binary"; exit 1; }
-
+          [ "$head_sha" = "$stamped" ] || { echo "::error::buildinfo is not stamped with the built commit (got '$stamped')"; exit 1; }
+          go version -m bin/server | grep -q 'go1\.27\.3' || { echo "::error::wrong Go toolchain"; exit 1; }
+          grep -q "Sub2API $version (commit: $head_sha, built: $built_at)" /tmp/release.version \
+            || { echo "::error::banner missing version/commit/date"; cat /tmp/release.version; exit 1; }
+          ! grep -qi 'commit: unknown' /tmp/release.version || { echo "::error::commit stamped as unknown"; exit 1; }
+          echo "::notice title=release provenance::version=$version commit=$head_sha built=$built_at sha256=$(cut -d' ' -f1 /tmp/release.sha256)"
       - name: Upload the release binary
         if: ${{ inputs.build_release == 'true' }}
         uses: actions/upload-artifact@v4
