@@ -1,0 +1,108 @@
+name: outbox-claim-verify
+
+# Push-triggered verification for the scheduler-outbox durable-claim change.
+#
+# workflow_dispatch on this fork started returning 422 "Actions has been disabled"
+# even though the permissions endpoint still reports enabled=true, so this workflow
+# is driven by the push event instead, which keeps working.
+#
+# Branches beginning with "release/" also build the deployable binary with the
+# production Makefile recipe and the full provenance stamp.
+on:
+  push:
+    branches:
+      - "probe/**"
+      - "fix/**"
+      - "release/**"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: build, unit and real-PostgreSQL concurrency tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+          cache: true
+
+      - name: Toolchain identity
+        run: |
+          go version
+          go version | grep -q "go1.27.3" || { echo "::error::go.mod requires go 1.27.3"; exit 1; }
+          echo "ref=${{ github.ref_name }} sha=$(git rev-parse HEAD)"
+
+      - name: gofmt (must be clean)
+        run: |
+          out="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$out" ]; then echo "::error::gofmt needs to run on: $out"; exit 1; fi
+
+      - name: go build ./...
+        run: go build ./...
+
+      - name: go vet (unit + integration tags)
+        run: |
+          go vet ./internal/service/ ./internal/repository/
+          go vet -tags=integration ./internal/repository/
+
+      - name: Unit tests (new queue path + legacy path)
+        run: go test -count=1 -run 'PollOutbox' -v ./internal/service/
+
+      - name: Regression (existing outbox tests)
+        run: go test -count=1 -run 'Outbox|SchedulerOutbox' -v ./internal/service/ ./internal/repository/
+
+      - name: Real PostgreSQL consumer concurrency tests
+        run: |
+          go test -tags=integration -count=1 -timeout 1200s \
+            -run 'TestOutboxClaim' -v ./internal/repository/ 2>&1 | tee /tmp/it.log
+          grep -q '^--- PASS' /tmp/it.log
+          ! grep -q '^--- FAIL' /tmp/it.log
+
+      - name: Release build with the production Makefile recipe
+        if: startsWith(github.ref_name, 'release/')
+        env:
+          GOFLAGS: -mod=mod -buildvcs=true
+        run: |
+          set -eu
+          head_sha="$(git rev-parse HEAD)"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          version="$(./scripts/resolve-version.sh)+outbox-durable-claim.1"
+          echo "building version=$version commit=$head_sha built=$built_at"
+          make build VERSION="$version" \
+            LDFLAGS="-s -w -X main.Version=$version -X main.Commit=$head_sha -X main.Date=$built_at -X main.BuildType=release"
+          ls -l bin/server
+          sha256sum bin/server | tee /tmp/release.sha256
+          ./bin/server --version 2>&1 | tee /tmp/release.version
+          go version -m bin/server | sed -n '1,6p'
+          stamped="$(go version -m bin/server | sed -n 's/.*vcs\.revision=\([0-9a-f]\{7,\}\).*/\1/p')"
+          echo "HEAD=$head_sha stamped=$stamped"
+          [ "$head_sha" = "$stamped" ] || { echo "::error::buildinfo is not stamped with the built commit (got '$stamped')"; exit 1; }
+          go version -m bin/server | grep -q 'go1\.27\.3' || { echo "::error::wrong Go toolchain"; exit 1; }
+          grep -q "Sub2API $version (commit: $head_sha, built: $built_at)" /tmp/release.version \
+            || { echo "::error::banner missing version/commit/date"; cat /tmp/release.version; exit 1; }
+          ! grep -qi 'commit: unknown' /tmp/release.version || { echo "::error::commit stamped as unknown"; exit 1; }
+          echo "::notice title=release provenance::version=$version commit=$head_sha built=$built_at sha256=$(cut -d' ' -f1 /tmp/release.sha256)"
+
+      - name: Upload the release binary
+        if: startsWith(github.ref_name, 'release/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-release-${{ github.sha }}
+          path: backend/bin/server
+          if-no-files-found: error
+          retention-days: 14
